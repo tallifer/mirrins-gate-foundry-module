@@ -19,7 +19,7 @@ You have two install paths. The manifest URL path is the standard one; the manua
 3. Paste this URL:
 
    ```
-   https://raw.githubusercontent.com/tallifer/mirrinsgate/main/foundry-module/module.json
+   https://raw.githubusercontent.com/tallifer/mirrins-gate-foundry-module/main/module.json
    ```
 
 4. Confirm. The Forge will fetch the manifest and download the module's release zip.
