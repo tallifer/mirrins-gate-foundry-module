@@ -16,7 +16,7 @@
       { "id": "pf2e", "type": "system" }
     ]
   },
-  "url": "https://github.com/tallifer/mirrinsgate",
-  "manifest": "https://raw.githubusercontent.com/tallifer/mirrinsgate/main/foundry-module/module.json",
-  "download": "https://github.com/tallifer/mirrinsgate/releases/download/foundry-module-v0.2.0/mirrins-gate-gold.zip"
+  "url": "https://github.com/tallifer/mirrins-gate-foundry-module",
+  "manifest": "https://raw.githubusercontent.com/tallifer/mirrins-gate-foundry-module/main/module.json",
+  "download": "https://github.com/tallifer/mirrins-gate-foundry-module/releases/download/v0.2.0/mirrins-gate-gold.zip"
 }
