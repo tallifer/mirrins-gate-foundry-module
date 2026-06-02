@@ -253,7 +253,7 @@ Hooks.once('init', () => {
 
   game.settings.register(MODULE_ID, 'webhookSecret', {
     name: 'Webhook secret',
-    hint: 'Shared secret — must match FOUNDRY_WEBHOOK_SECRET set in Supabase. Treat as sensitive: anyone with this value can post arbitrary gold updates.',
+    hint: 'Shared secret — must match FOUNDRY_WEBHOOK_SECRET in Supabase (gold-webhook) and Netlify (purchase broker). SENSITIVE: with this value an attacker can post arbitrary gold updates AND drive the purchase broker — claim/complete/cancel purchases and read purchase rows + buyer character mappings. GM-only; do not give players GM access while it is populated.',
     scope: 'world',
     config: true,
     type: String,
@@ -271,22 +271,13 @@ Hooks.once('init', () => {
     restricted: true,
   });
 
-  // ── Purchase processor settings (v0.2) ──
-  // The processor only starts when all three are set and processorEnabled is on.
-  // Leaving them blank keeps the v0.1 gold-push running with no processor.
-  game.settings.register(MODULE_ID, 'supabaseUrl', {
-    name: 'Supabase URL',
-    hint: 'Your Supabase project URL (e.g. https://<project>.supabase.co). Required for the purchase processor; leave blank to run gold-sync only.',
-    scope: 'world',
-    config: true,
-    type: String,
-    default: '',
-    restricted: true,
-  });
-
-  game.settings.register(MODULE_ID, 'supabaseServiceRoleKey', {
-    name: 'Supabase service-role key',
-    hint: 'The service-role key from Supabase → Project Settings → API. SENSITIVE: it bypasses all row security. Anyone with GM access to this world can read it, so do not grant players GM while it is set. Required for the purchase processor.',
+  // ── Purchase processor settings (v0.2.1) ──
+  // The processor only starts when the Processor URL and Webhook secret are both
+  // set and processorEnabled is on. Leaving the Processor URL blank keeps the
+  // v0.1 gold-push running with no processor.
+  game.settings.register(MODULE_ID, 'processorUrl', {
+    name: 'Processor URL',
+    hint: "Full URL of the Mirrin's Gate Netlify broker function (e.g. https://<site>.netlify.app/.netlify/functions/foundry-processor). Required for the purchase processor; leave blank to run gold-sync only. Authenticated with the Webhook secret above — no service-role key lives in Foundry any more.",
     scope: 'world',
     config: true,
     type: String,
@@ -296,7 +287,7 @@ Hooks.once('init', () => {
 
   game.settings.register(MODULE_ID, 'processorEnabled', {
     name: 'Enable purchase processor',
-    hint: 'Master kill-switch for processing website purchases (claim, deduct gold, grant items). Turn off to pause processing without clearing the URL/key. Has no effect on gold-sync.',
+    hint: 'Master kill-switch for processing website purchases (claim, deduct gold, grant items). Turn off to pause processing without clearing the Processor URL. Has no effect on gold-sync.',
     scope: 'world',
     config: true,
     type: Boolean,
@@ -343,7 +334,7 @@ for (const hookName of ['createItem', 'updateItem', 'deleteItem']) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
-// PURCHASE PROCESSOR (v0.2) — GM-only.
+// PURCHASE PROCESSOR (v0.2.1) — GM-only.
 //
 // When the active GM has Foundry open, pending website purchases are claimed
 // atomically (pending -> processing via the claim_purchase RPC, so two GM
@@ -351,20 +342,22 @@ for (const hookName of ['createItem', 'updateItem', 'deleteItem']) {
 // deducted, items granted to the buyer's mapped character), then marked
 // completed — or rejected with stock restored.
 //
-// The Supabase client is loaded with a *dynamic* import so a blocked CDN (e.g.
-// The Forge's CSP) disables only the processor; the v0.1 gold-push above keeps
-// working regardless.
+// Supabase blocks service-role calls from a browser origin, so all data access
+// goes through the Mirrin's Gate Netlify broker function (see callProcessor):
+// Foundry authenticates with the shared webhook secret and the broker holds the
+// service-role key server-side. Pending purchases are discovered by polling the
+// broker's list-pending action every 10s (no Realtime, no esm.sh import); the
+// GM-presence heartbeat is folded into that same call. The v0.1 gold-push above
+// is independent and keeps working regardless.
 // ═════════════════════════════════════════════════════════════════════════
 
 const PROC_PREFIX = `${LOG_PREFIX} proc:`;
-const HEARTBEAT_MS = 15_000;
-const SUPABASE_ESM = 'https://esm.sh/@supabase/supabase-js@2';
+const POLL_MS = 10_000;
 
-let sb = null;               // Supabase service-role client (null until started)
 let processorStarted = false;
-let heartbeatTimer = null;
 let packIndexCache = null;   // [{ pack, index }], cached for the processor's run
-const purchaseQueue = [];    // FIFO of raw purchase rows awaiting processing
+const purchaseQueue = [];    // FIFO of pending purchase refs ({id, created_at}) awaiting processing
+const seenPurchaseIds = new Set(); // ids currently queued or in flight; released when the attempt concludes
 let draining = false;
 
 function plog(...args)   { console.log(PROC_PREFIX, ...args); }
@@ -372,8 +365,8 @@ function pdebug(...args) { console.debug(PROC_PREFIX, ...args); }
 function pwarn(...args)  { console.warn(PROC_PREFIX, ...args); }
 
 function processorConfigured() {
-  return !!game.settings.get(MODULE_ID, 'supabaseUrl')
-      && !!game.settings.get(MODULE_ID, 'supabaseServiceRoleKey');
+  return !!game.settings.get(MODULE_ID, 'processorUrl')
+      && !!game.settings.get(MODULE_ID, 'webhookSecret');
 }
 
 // Re-checked on every event, not just at startup, so toggling the kill-switch
@@ -382,6 +375,38 @@ function processorActive() {
   return !!game.user?.isGM
       && isPf2e()
       && game.settings.get(MODULE_ID, 'processorEnabled') === true;
+}
+
+// Single choke-point for every broker call. POSTs { action, ...payload } to the
+// Netlify function with the shared webhook secret, parses the JSON reply, and
+// normalises failures (network error or non-2xx HTTP) to a branchable
+// { ok:false, status, error } shape so callers never touch fetch/HTTP directly.
+// On success it returns the parsed body verbatim (which always carries `ok`).
+async function callProcessor(action, payload = {}) {
+  const url = game.settings.get(MODULE_ID, 'processorUrl');
+  const secret = game.settings.get(MODULE_ID, 'webhookSecret');
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Webhook-Secret': secret,
+      },
+      body: JSON.stringify({ action, ...payload }),
+    });
+  } catch (err) {
+    pwarn(`${action}: network error`, err);
+    return { ok: false, status: 0, error: String(err?.message || err) };
+  }
+  let parsed = null;
+  try { parsed = await res.json(); } catch { /* non-JSON or empty body */ }
+  if (!res.ok) {
+    const error = parsed?.error || res.statusText;
+    pwarn(`${action}: HTTP ${res.status} — ${error}`);
+    return { ok: false, status: res.status, error };
+  }
+  return parsed ?? { ok: true };
 }
 
 // PF2e price.value accepts a partial coins object; decompose cp for tidy display.
@@ -456,10 +481,8 @@ function summarizePurchase(items) {
 
 async function rejectPurchase(id, status, reason) {
   pwarn(`rejected ${id} as ${status}: ${reason}`);
-  const { error } = await sb.rpc('cancel_purchase', {
-    purchase_id: id, new_status: status, reason,
-  });
-  if (error) pwarn(`cancel_purchase RPC failed for ${id}`, error);
+  const res = await callProcessor('cancel', { purchase_id: id, new_status: status, reason });
+  if (!res.ok) pwarn(`cancel failed for ${id}: ${res.error}`);
   ui.notifications?.warn(`Mirrin's Gate: purchase rejected — ${reason}`);
 }
 
@@ -467,30 +490,35 @@ async function rejectPurchase(id, status, reason) {
 // is left mid-fulfilment (`processing`) for manual recovery; the queue catches
 // it and continues.
 async function processPurchase(rawRow) {
-  if (!processorActive() || !sb) return;
+  if (!processorActive()) return;
   const rawId = rawRow?.id;
   if (!rawId) return;
 
-  // 1. Atomic claim. Exactly one client moves the row pending -> processing.
-  const { data: claimData, error: claimErr } = await sb.rpc('claim_purchase', { purchase_id: rawId });
-  if (claimErr) { pwarn(`claim error for ${rawId}`, claimErr); return; }
-  const claimed = Array.isArray(claimData) ? claimData[0] : claimData;
-  if (!claimed?.id) {
+  // 1. Atomic claim. Exactly one client moves the row pending -> processing; the
+  //    broker returns the authoritative row plus the buyer mapping in one call.
+  const claimRes = await callProcessor('claim', { purchase_id: rawId });
+  if (!claimRes.ok) { pwarn(`claim error for ${rawId}: ${claimRes.error}`); return; }
+  if (claimRes.claimed === false) {
     pdebug(`claim failed for ${rawId} (already processed by another client)`);
     return;
   }
+  const claimed = claimRes.purchase;
+  if (!claimed?.id) { pwarn(`claim for ${rawId} returned no row`); return; }
 
   const items = Array.isArray(claimed.items) ? claimed.items : [];
   const totalCp = Number(claimed.total_cp) || 0;
 
-  // 2. Buyer mapping.
-  const { data: mapping, error: mapErr } = await sb
-    .from('user_characters')
-    .select('actor_id, display_name')
-    .eq('user_id', claimed.user_id)
-    .maybeSingle();
-  if (mapErr)   { await rejectPurchase(claimed.id, 'rejected_other', 'could not read buyer mapping'); return; }
-  if (!mapping) { await rejectPurchase(claimed.id, 'rejected_other', 'buyer has no character mapping'); return; }
+  // 2. Buyer mapping — returned with the claim, no separate read. A null mapping
+  //    is either "no row" (buyer_error null) or "couldn't read it" (buyer_error
+  //    set — a Supabase/network error after the claim). Reject either way so the
+  //    already-`processing` row never strands; keep the two reasons distinct.
+  const mapping = claimRes.buyer;
+  if (!mapping) {
+    if (claimRes.buyer_error) pwarn(`buyer mapping read failed for ${claimed.id}: ${claimRes.buyer_error}`);
+    const reason = claimRes.buyer_error ? 'could not read buyer mapping' : 'buyer has no character mapping';
+    await rejectPurchase(claimed.id, 'rejected_other', reason);
+    return;
+  }
 
   plog(`picked up ${claimed.id} for ${mapping.display_name}, total ${totalCp} cp, ${items.length} item(s)`);
 
@@ -556,9 +584,9 @@ async function processPurchase(rawRow) {
   //    `processing` (a visible stuck row). See README / TODO.md for recovery.
   await buyerActor.createEmbeddedDocuments('Item', toCreate);
 
-  // 9. Mark completed.
-  const { error: compErr } = await sb.rpc('complete_purchase', { purchase_id: claimed.id });
-  if (compErr) { pwarn(`complete_purchase RPC failed for ${claimed.id}`, compErr); throw compErr; }
+  // 9. Mark completed via the broker.
+  const compRes = await callProcessor('complete', { purchase_id: claimed.id });
+  if (!compRes.ok) { pwarn(`complete failed for ${claimed.id}: ${compRes.error}`); throw new Error(`complete_purchase failed: ${compRes.error}`); }
 
   plog(`completed ${claimed.id}`);
   // 10. Toast.
@@ -571,6 +599,12 @@ async function processPurchase(rawRow) {
 // Serial queue: one worker, never parallel, continue on error.
 function enqueuePurchase(row) {
   if (!row?.id) return;
+  // The poll returns the same pending id every tick until it's claimed, so skip
+  // ids already queued or in flight. drainQueue releases the id once its attempt
+  // concludes, so a still-pending row is re-discovered and retried on a later
+  // poll. claim_purchase remains the authoritative cross-client dedup.
+  if (seenPurchaseIds.has(row.id)) return;
+  seenPurchaseIds.add(row.id);
   purchaseQueue.push(row);
   drainQueue();
 }
@@ -585,6 +619,13 @@ async function drainQueue() {
         await processPurchase(row);
       } catch (err) {
         pwarn(`error processing ${row?.id} (queue continues)`, err);
+      } finally {
+        // Release the id once the attempt concludes (any exit path). If the row
+        // is still pending — transient claim error, or disabled mid-flight
+        // before the claim — the next poll re-discovers and retries it. If it
+        // reached a terminal/processing state it is no longer pending, so
+        // list-pending won't resurface it and releasing is harmless.
+        if (row?.id) seenPurchaseIds.delete(row.id);
       }
     }
   } finally {
@@ -592,81 +633,46 @@ async function drainQueue() {
   }
 }
 
-async function sendHeartbeat() {
-  if (!processorActive() || !sb) return;
-  try {
-    const { error } = await sb.from('gm_presence')
-      .upsert({ id: 1, updated_at: new Date().toISOString() });
-    if (error) pdebug('heartbeat upsert failed', error);
-  } catch (err) {
-    pdebug('heartbeat error', err);
-  }
-}
-
-function subscribePurchaseInserts() {
-  return sb.channel('mg-purchase-processor')
-    .on('postgres_changes',
-      { event: 'INSERT', schema: 'public', table: 'purchases', filter: 'status=eq.pending' },
-      (payload) => {
-        if (!processorActive()) return;
-        enqueuePurchase(payload.new);
-      })
-    .subscribe((status) => pdebug(`realtime subscription: ${status}`));
-}
-
-async function bootScan() {
-  const { data, error } = await sb.from('purchases')
-    .select('*')
-    .eq('status', 'pending')
-    .order('created_at', { ascending: true });
-  if (error) { pwarn('boot scan query failed', error); return; }
-  pdebug(`boot scan found ${data?.length ?? 0} pending purchase(s)`);
-  for (const row of data ?? []) enqueuePurchase(row);
+// One poll tick: ask the broker for pending purchase ids (it folds the
+// GM-presence heartbeat into the same call) and enqueue any not already queued.
+// Self-gates on every required condition: GM + PF2e + kill-switch on
+// (processorActive) AND Processor URL + Webhook secret set (processorConfigured).
+// While any are missing we skip the tick — no broker call fires, no
+// Netlify/Supabase cost, heartbeat stops. The timer itself is created
+// unconditionally in startProcessor, so flipping the kill-switch on or filling
+// in the URL/secret mid-session resumes polling and presence live, with no
+// world reload.
+async function pollPending() {
+  if (!processorActive() || !processorConfigured()) return;
+  const res = await callProcessor('list-pending');
+  if (!res.ok) return;  // callProcessor already logged; the next tick retries
+  for (const row of res.pending ?? []) enqueuePurchase(row);
 }
 
 async function startProcessor() {
   if (processorStarted) return;
   if (!game.user?.isGM || !isPf2e()) return;
-  if (game.settings.get(MODULE_ID, 'processorEnabled') !== true) {
-    log('proc: disabled by the "Enable purchase processor" setting.');
-    return;
-  }
-  if (!processorConfigured()) {
-    log('proc: disabled — set "Supabase URL" and "Supabase service-role key" to enable.');
-    return;
-  }
-
-  let createClient;
-  try {
-    ({ createClient } = await import(SUPABASE_ESM));
-  } catch (err) {
-    pwarn(`failed to load supabase-js from ${SUPABASE_ESM}; processor disabled for this session (gold-sync unaffected).`, err);
-    return;
-  }
-
-  try {
-    sb = createClient(
-      game.settings.get(MODULE_ID, 'supabaseUrl'),
-      game.settings.get(MODULE_ID, 'supabaseServiceRoleKey'),
-      { auth: { persistSession: false, autoRefreshToken: false } },
-    );
-  } catch (err) {
-    pwarn('failed to create Supabase client; processor disabled for this session.', err);
-    sb = null;
-    return;
-  }
 
   processorStarted = true;
-  log('proc: started. Heartbeat + boot scan + realtime active.');
 
-  // Heartbeat first so presence appears promptly.
-  sendHeartbeat();
-  heartbeatTimer = setInterval(sendHeartbeat, HEARTBEAT_MS);
+  // One-time startup status reflecting the current settings. pollPending stays
+  // silent on every tick when paused/unconfigured, so this is the only line.
+  if (game.settings.get(MODULE_ID, 'processorEnabled') !== true) {
+    log('proc: kill-switch off — polling idle until "Enable purchase processor" is on.');
+  } else if (!processorConfigured()) {
+    log('proc: disabled — set "Processor URL" and "Webhook secret" to enable.');
+  } else {
+    log('proc: started. Polling the broker every 10s (boot scan + heartbeat folded in).');
+  }
 
-  // Subscribe BEFORE the boot scan so a purchase created during startup can't
-  // slip through the gap; any overlap is harmless (claim_purchase dedupes).
-  try { subscribePurchaseInserts(); } catch (err) { pwarn('realtime subscribe failed', err); }
-  try { await bootScan(); } catch (err) { pwarn('boot scan failed', err); }
+  // The interval lives for the life of the client. pollPending self-gates and
+  // does no broker call (no cost, heartbeat stops) while paused or unconfigured,
+  // so enabling/configuring mid-session resumes live with no world reload. Two
+  // GM tabs both polling is fine — claim_purchase dedupes the race.
+  await pollPending();
+  setInterval(() => {
+    pollPending().catch((err) => pwarn('poll error', err));
+  }, POLL_MS);
 }
 
 Hooks.once('ready', () => {
