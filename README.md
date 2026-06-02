@@ -19,12 +19,12 @@ You have two install paths. The manifest URL path is the standard one; the manua
 3. Paste this URL:
 
    ```
-   https://raw.githubusercontent.com/tallifer/mirrinsgate/main/foundry-module/module.json
+   https://raw.githubusercontent.com/tallifer/mirrins-gate-foundry-module/main/module.json
    ```
 
 4. Confirm. The Forge will fetch the manifest and download the module's release zip.
 
-Note: this path requires a GitHub release named `foundry-module-v0.1.0` with `mirrins-gate-gold.zip` attached, matching the `download` URL in `module.json`. If no such release exists yet, use the manual install below.
+Note: this path requires a GitHub release tagged `v0.2.1` with `mirrins-gate-gold.zip` attached, matching the `download` URL in `module.json`. If no such release exists yet, use the manual install below.
 
 ### Manual install
 
@@ -48,7 +48,7 @@ Open **Game Settings** → **Configure Settings** → **Module Settings**, scrol
 
 **Webhook URL.** The full URL of the deployed Supabase Edge Function. It looks like `https://<your-project>.supabase.co/functions/v1/foundry-gold-webhook`. You can find your project ref in the Supabase dashboard under Project Settings.
 
-**Webhook secret.** The shared secret. It must match the `FOUNDRY_WEBHOOK_SECRET` environment variable set on the Supabase function. Treat this value as sensitive — anyone who knows the URL and the secret can post any gold figure they like to your marketplace. Foundry has no masked-input UI for settings, so the value will be visible in the settings dialog; do not give players GM access while it's populated.
+**Webhook secret.** The shared secret. It must match the `FOUNDRY_WEBHOOK_SECRET` environment variable, which now lives in **two** places: the Supabase gold-webhook and the Netlify purchase broker (the same value in both). Treat this value as sensitive — with it, an attacker can not only post any gold figure to your marketplace but also drive the purchase broker: claim, complete, or cancel purchases, and read purchase rows and buyers' character mappings. The audience is the same as before (your GMs), but the capability is wider, so guard it accordingly. Foundry has no masked-input UI for settings, so the value will be visible in the settings dialog; do not give players GM access while it's populated.
 
 **Party actor id.** Leave this blank if your world has exactly one Party actor — the module will auto-detect it. Otherwise, paste the actor id. To find it, open a browser console (F12) in the Foundry tab and run:
 
@@ -105,22 +105,40 @@ notification toast.
 
 ### Settings
 
-Three new fields appear under **Module Settings → Mirrin's Gate**, alongside the
-gold-sync fields:
+The processor's settings sit under **Module Settings → Mirrin's Gate**, alongside
+the gold-sync fields. Only **Processor URL** is new in 0.2.1 — it replaces the
+two Supabase fields (URL and service-role key) that 0.2.0 used; the kill-switch
+carried over unchanged:
 
-- **Supabase URL** — your project URL, e.g. `https://<project>.supabase.co`.
-- **Supabase service-role key** — from Supabase → Project Settings → API → the
-  **service_role** key. **This is sensitive**: it bypasses all row security.
-  Anyone with GM access to this world can read it from the settings dialog, so
-  do not give players GM while it is populated.
-- **Enable purchase processor** — a master kill-switch (on by default). Turn it
-  off to pause processing without clearing the URL/key. It does not affect
-  gold-sync.
+- **Processor URL** *(new in 0.2.1)* — the full URL of the deployed Mirrin's Gate
+  Netlify broker function, e.g.
+  `https://<site>.netlify.app/.netlify/functions/foundry-processor`. The
+  processor talks only to this broker; the broker holds the Supabase
+  service-role key in its own server-side environment, so **no service-role key
+  lives in Foundry any more**.
+- **Enable purchase processor** — a master kill-switch (on by default, carried
+  over from 0.2.0). Turn it off to pause processing without clearing the
+  Processor URL; it resumes live when re-enabled, with no world reload. It does
+  not affect gold-sync.
 
-If the URL or key is blank, or the kill-switch is off, the processor stays
-silent and the v0.1 gold-sync keeps working. You'll see one line on startup:
-`[mirrins-gate-gold] proc: disabled — set "Supabase URL" and "Supabase
-service-role key" to enable.`
+The processor authenticates to the broker with the same **Webhook secret** you
+already set for gold-sync — one secret covers both (see the note on its widened
+reach above).
+
+If the Processor URL or Webhook secret is blank, or the kill-switch is off, the
+processor stays silent and the v0.1 gold-sync keeps working. You'll see one line
+on startup: `[mirrins-gate-gold] proc: disabled — set "Processor URL" and
+"Webhook secret" to enable.`
+
+### Polling cost — turn it off between sessions
+
+While the processor is enabled and Foundry is open, the GM client polls the
+broker every 10 seconds. That's a steady stream of Netlify function invocations
+even when nothing is happening — fine for a 4-hour session, but a tab left open
+for days can exhaust Netlify's free-tier function quota and suspend the whole
+site (login and marketplace included), with no grace period until the next
+month. **Disable the processor (or just close Foundry) when you're not running a
+session.**
 
 ### Single-shared-world assumption
 
@@ -150,10 +168,6 @@ refund gold — check the party's coin total in Foundry and re-add it manually.
 
 All processor logs are prefixed `[mirrins-gate-gold] proc:` in the console (F12).
 
-- **CDN blocked.** The processor loads the Supabase library from `esm.sh` on
-  demand. If your host (e.g. The Forge) blocks it, you'll see `proc: failed to
-  load supabase-js …; processor disabled for this session` — gold-sync still
-  works; purchases just won't process until the CDN is reachable.
 - **Item not in a compendium.** `purchase rejected — item '<name>' not found in
   any compendium`. The `foundry_name` in the catalogue doesn't match any
   compendium item. Fix the name in `marketplace.json` (and re-seed as admin), or
